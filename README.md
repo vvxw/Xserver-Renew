@@ -9,7 +9,7 @@
 
 4. 打开 .github/workflows/renew.yml 文件，全选内容复制粘贴进yml文件编辑框 保存
 
-5. app.js 里填写账号密码 和 tg推送通知环境变量保存，或者在Settings --- secrets and variables --- Actions 里添加 secrets
+5. app.js 里填写账号密码 和 tg推送通知(可选)环境变量保存，或者在Settings --- secrets and variables --- Actions 里添加 secrets
 
 ### 相关环境变量
 
