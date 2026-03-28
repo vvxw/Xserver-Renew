@@ -23,8 +23,8 @@ ACCOUNTS格式示例：
 ```
 [
     {
-        "username": "", 
-        "password": ""  
+        "username": "your-xserver-email@gmail.com", 
+        "password": "your-xerver-password"  
     }
 ]
 ```
