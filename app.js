@@ -2,18 +2,48 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 
-// Telegram API 配置
-const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const ACCOUNTS = process.env.ACCOUNTS || `
 [
     {
         "username": "", 
         "password": ""  
     }
-]`; // 双引号内填写你的邮箱和密码 
+]`; // 双引号内填写你的邮箱和密码,可以是多账户但不建议,会封号
 
+// Telegram API 配置
+const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 
+// 代理配置（socks5 代理，Playwright 和 fetch 共用）
+const IS_PROXY = process.env.IS_PROXY === 'true';
+const PROXY_SERVER = process.env.PROXY_SERVER || 'socks5://127.0.0.1:1080';
+
+// 如果启用了代理，为全局 fetch 设置代理
+if (IS_PROXY && PROXY_SERVER) {
+    try {
+        const { ProxyAgent, setGlobalDispatcher } = require('undici');
+        setGlobalDispatcher(new ProxyAgent(PROXY_SERVER));
+        // console.log(`✅ fetch 代理已启用: ${PROXY_SERVER}`);
+    } catch (e) {
+        console.warn(`⚠️ 无法加载 undici 代理模块，fetch 将直连: ${e.message}`);
+    }
+} else {
+    // console.log('ℹ️ 未启用代理，fetch 直连模式');
+}
+// 获取当前上海时间
+function getShanghaiTime() {
+    return new Date().toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    });
+}
+// 发送tg通知
 async function sendTelegramNotification(message, imagePath = null) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
         console.log('未设置 Telegram Bot Token 或 Chat ID，跳过通知。');
@@ -53,14 +83,14 @@ async function sendTelegramNotification(message, imagePath = null) {
             if (!response.ok) {
                 console.error('Telegram 消息发送失败:', await response.text());
             } else {
-                console.log('Telegram 文字通知已发送');
+                console.log('✅ Telegram 文字通知已发送');
             }
         }
     } catch (error) {
         console.error('发送 Telegram 通知时出错:', error);
     }
 }
-
+// 续期流程
 (async () => {
     let users = [];
     try {
@@ -79,13 +109,36 @@ async function sendTelegramNotification(message, imagePath = null) {
         process.exit(1);
     }
 
-    const browser = await chromium.launch({
+    const launchOptions = {
         headless: true,
         channel: 'chrome',
-    });
+    };
+
+    // 为 Playwright 浏览器配置代理
+    if (IS_PROXY && PROXY_SERVER) {
+        launchOptions.proxy = { server: PROXY_SERVER };
+        console.log(`✅ 浏览器代理已启用: ${PROXY_SERVER}`);
+    } else {
+        console.log('ℹ️ 浏览器直连模式');
+    }
+
+    const browser = await chromium.launch(launchOptions);
+
+    // 获取出站真实 IP
+    try {
+        const ipRes = await fetch('https://api.ip.sb/ip');
+        if (ipRes.ok) {
+            const ip = (await ipRes.text()).trim();
+            console.log(`📍 当前出口IP: ${ip}${IS_PROXY ? ' (代理)' : ' (直连)'}`);
+        } else {
+            console.warn(`⚠️ 获取出站 IP 失败: HTTP ${ipRes.status}`);
+        }
+    } catch (e) {
+        console.warn(`⚠️ 获取出站 IP 出错: ${e.message}`);
+    }
 
     for (const user of users) {
-        console.log(`正在处理用户: ${user.username}`);
+        console.log(`👤 正在处理用户: ${user.username}`);
         const context = await browser.newContext();
         const page = await context.newPage();
 
@@ -117,9 +170,9 @@ async function sendTelegramNotification(message, imagePath = null) {
 
                 let msg;
                 if (match && match[1]) {
-                    msg = `🚀 *Xserver 续期通知* \n\n⚠️ 用户 ${user.username} 目前无法续期\n下次续期时间在：${match[1]}`;
+                    msg = `🇯🇵 Xserver 续期通知\n\n⚠️ 未到续期时间\n👤 账户 ${user.username} 可续期：${match[1]}\n🕐 运行时间：${getShanghaiTime()}`;
                 } else {
-                    msg = `🚀 *Xserver 续期通知* \n\n⚠️ 用户 ${user.username} 未找到 '期限延长' 按钮。可能无法延长。`;
+                    msg = `🇯🇵 Xserver 续期通知\n\n⚠️ 用户 ${user.username} 未找到 '期限延长' 按钮。可能无法延长。\n\n🕐 运行时间：${getShanghaiTime()}`;
                 }
 
                 console.log(msg);
@@ -134,20 +187,20 @@ async function sendTelegramNotification(message, imagePath = null) {
             await page.getByRole('button', { name: '確認画面に進む' }).click();
 
             // 6. 执行延长
-            console.log(`正在点击用户 ${user.username} 的最终延长按钮...`);
+            console.log(`🖱️ 正在点击用户 ${user.username} 的最终延长按钮...`);
             await page.getByRole('button', { name: '期限を延長する' }).click();
 
             // 7. 返回
             await page.getByRole('link', { name: '戻る' }).click();
 
-            const successMsg = `🇯🇵 Xserver 续期通知\n\n✅ 用户 ${user.username} 成功续期`;
+            const successMsg = `🇯🇵 Xserver 续期通知\n\n✅ 续期成功\n👤 账户 ${user.username}\n🕐 运行时间：${getShanghaiTime()}`;
             console.log(successMsg);
             const successPath = `success_${user.username}.png`;
             await page.screenshot({ path: successPath });
             await sendTelegramNotification(successMsg, successPath);
 
         } catch (error) {
-            const errorMsg = `❌ *Xserver 续期通知* \n\n❌ 用户 ${user.username} 处理失败: ${error}`;
+            const errorMsg = `❌ Xserver 续期通知\n\n❌ 续期失败\n👤 账户 ${user.username}\n❌ 错误信息：${error}\n\n🕐 运行时间：${getShanghaiTime()}`;
             console.error(errorMsg);
             const errorPath = `error_${user.username}.png`;
             await page.screenshot({ path: errorPath });
