@@ -1,14 +1,17 @@
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth')();
 const path = require('path');
 const fs = require('fs');
+
+chromium.use(StealthPlugin);
 
 const ACCOUNTS = process.env.ACCOUNTS || `
 [
     {
-        "username": "", 
-        "password": ""  
+        "username": "",
+        "password": ""
     }
-]`; // 双引号内填写你的邮箱和密码,可以是多账户但不建议,会封号
+]`;
 
 // Telegram API 配置
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
@@ -30,7 +33,7 @@ if (IS_PROXY && PROXY_SERVER) {
 } else {
     // console.log('ℹ️ 未启用代理，fetch 直连模式');
 }
-// 获取当前上海时间
+
 function getShanghaiTime() {
     return new Date().toLocaleString('zh-CN', {
         timeZone: 'Asia/Shanghai',
@@ -43,7 +46,7 @@ function getShanghaiTime() {
         hour12: false,
     });
 }
-// 发送tg通知
+
 async function sendTelegramNotification(message, imagePath = null) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
         console.log('未设置 Telegram Bot Token 或 Chat ID，跳过通知。');
@@ -90,7 +93,50 @@ async function sendTelegramNotification(message, imagePath = null) {
         console.error('发送 Telegram 通知时出错:', error);
     }
 }
-// 续期流程
+
+async function detectTurnstile(page) {
+    try {
+        const selectors = [
+            'iframe[src*="turnstile"]',
+            'input[name="cf-turnstile-response"]',
+            'div.cf-challenge',
+            'iframe[src*="challenges.cloudflare.com"]'
+        ];
+
+        for (const selector of selectors) {
+            const count = await page.locator(selector).count();
+            if (count > 0) {
+                return true;
+            }
+        }
+    } catch (e) {
+        // 忽略选择器查询错误，继续往下处理
+    }
+
+    return false;
+}
+
+async function waitForGameManagement(page) {
+    const gameManagementLink = page.getByRole('link', { name: 'ゲーム管理' });
+
+    try {
+        await gameManagementLink.waitFor({ state: 'visible', timeout: 30000 });
+        return true;
+    } catch (error) {
+        const challengeFound = await detectTurnstile(page);
+
+        if (challengeFound) {
+            const screenshotPath = `turnstile_${Date.now()}.png`;
+            await page.screenshot({ path: screenshotPath, fullPage: true });
+            throw new Error(
+                'Cloudflare Turnstile challenge detected after login; the page is blocked before reaching the game management page. This requires a real browser flow or a captcha solving service.'
+            );
+        }
+
+        return false;
+    }
+}
+
 (async () => {
     let users = [];
     try {
@@ -112,9 +158,13 @@ async function sendTelegramNotification(message, imagePath = null) {
     const launchOptions = {
         headless: true,
         channel: 'chrome',
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-dev-shm-usage'
+        ]
     };
 
-    // 为 Playwright 浏览器配置代理
     if (IS_PROXY && PROXY_SERVER) {
         launchOptions.proxy = { server: PROXY_SERVER };
         console.log(`✅ 浏览器代理已启用: ${PROXY_SERVER}`);
@@ -124,7 +174,6 @@ async function sendTelegramNotification(message, imagePath = null) {
 
     const browser = await chromium.launch(launchOptions);
 
-    // 获取出站真实 IP
     try {
         const ipRes = await fetch('https://api.ip.sb/ip');
         if (ipRes.ok) {
@@ -139,32 +188,56 @@ async function sendTelegramNotification(message, imagePath = null) {
 
     for (const user of users) {
         console.log(`👤 正在处理用户: ${user.username}`);
-        const context = await browser.newContext();
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            locale: 'ja-JP',
+            timezoneId: 'Asia/Tokyo',
+            viewport: { width: 1440, height: 1200 }
+        });
         const page = await context.newPage();
 
         try {
-            // 1. 导航到登录页面
-            await page.goto('https://secure.xserver.ne.jp/xapanel/login/xmgame');
+            await page.goto('https://secure.xserver.ne.jp/xapanel/login/xmgame', {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            });
 
-            // 2. 登录
             await page.getByRole('textbox', { name: 'XServerアカウントID または メールアドレス' }).click();
             await page.getByRole('textbox', { name: 'XServerアカウントID または メールアドレス' }).fill(user.username);
             await page.locator('#user_password').fill(user.password);
-            await page.getByRole('button', { name: 'ログインする' }).click();
+            await page.locator('#login-submit').click();
 
-            // 等待导航
+            await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => null);
+
+            const postLoginChallenge = await detectTurnstile(page);
+            if (postLoginChallenge) {
+                const screenshotPath = `turnstile_${user.username}.png`;
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                const msg = `❌ Xserver 续期通知\n\n❌ 登录后被 Cloudflare Turnstile 拦截\n👤 账户 ${user.username}\n❌ 原因：登录后页面触发 Turnstile 人机验证，脚本无法在 CI 中自动完成。\n🕐 运行时间：${getShanghaiTime()}`;
+                console.error(msg);
+                await sendTelegramNotification(msg, screenshotPath);
+                continue;
+            }
+
+            const managementVisible = await waitForGameManagement(page);
+            if (!managementVisible) {
+                const screenshotPath = `no_game_manager_${user.username}.png`;
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                const msg = `❌ Xserver 续期通知\n\n❌ 登录后未加载到「ゲーム管理」页面\n👤 账户 ${user.username}\n❌ 可能是登录失败、页面被防护拦截或账号需要二次验证。\n🕐 运行时间：${getShanghaiTime()}`;
+                console.error(msg);
+                await sendTelegramNotification(msg, screenshotPath);
+                continue;
+            }
+
             await page.getByRole('link', { name: 'ゲーム管理' }).click();
             await page.waitForLoadState('networkidle');
 
-            // 3. 升级 / 延长
             await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
 
-            // 4. 选择 '延长期间' - 检查是否可用
             try {
                 await page.getByRole('link', { name: '期限を延長する' }).waitFor({ state: 'visible', timeout: 5000 });
                 await page.getByRole('link', { name: '期限を延長する' }).click();
             } catch (e) {
-                // 检查是否有具体的下一次更新时间提示
                 const bodyText = await page.locator('body').innerText();
                 const match = bodyText.match(/更新をご希望の場合は、(.+?)以降にお試しください。/);
 
@@ -172,25 +245,19 @@ async function sendTelegramNotification(message, imagePath = null) {
                 if (match && match[1]) {
                     msg = `🇯🇵 Xserver 续期通知\n\n⚠️ 未到续期时间\n👤 账户 ${user.username} 可续期：${match[1]}\n🕐 运行时间：${getShanghaiTime()}`;
                 } else {
-                    msg = `🇯🇵 Xserver 续期通知\n\n⚠️ 用户 ${user.username} 未找到 '期限延长' 按钮。可能无法延长。\n\n🕐 运行时间：${getShanghaiTime()}`;
+                    msg = `🇯🇵 Xserver 续期通知\n\n⚠️ 用户 ${user.username} 未找到 '期限延長' 按钮。可能无法延长。\n\n🕐 运行时间：${getShanghaiTime()}`;
                 }
 
                 console.log(msg);
-                // 保存截图
                 const screenshotPath = `skip_${user.username}.png`;
                 await page.screenshot({ path: screenshotPath });
                 await sendTelegramNotification(msg, screenshotPath);
                 continue;
             }
 
-            // 5. 确认
             await page.getByRole('button', { name: '確認画面に進む' }).click();
-
-            // 6. 执行延长
             console.log(`🖱️ 正在点击用户 ${user.username} 的最终延长按钮...`);
             await page.getByRole('button', { name: '期限を延長する' }).click();
-
-            // 7. 返回
             await page.getByRole('link', { name: '戻る' }).click();
 
             const successMsg = `🇯🇵 Xserver 续期通知\n\n✅ 续期成功\n👤 账户 ${user.username}\n🕐 运行时间：${getShanghaiTime()}`;
@@ -198,12 +265,11 @@ async function sendTelegramNotification(message, imagePath = null) {
             const successPath = `success_${user.username}.png`;
             await page.screenshot({ path: successPath });
             await sendTelegramNotification(successMsg, successPath);
-
         } catch (error) {
             const errorMsg = `❌ Xserver 续期通知\n\n❌ 续期失败\n👤 账户 ${user.username}\n❌ 错误信息：${error}\n\n🕐 运行时间：${getShanghaiTime()}`;
             console.error(errorMsg);
             const errorPath = `error_${user.username}.png`;
-            await page.screenshot({ path: errorPath });
+            await page.screenshot({ path: errorPath }).catch(() => {});
             await sendTelegramNotification(errorMsg, errorPath);
         } finally {
             await context.close();
